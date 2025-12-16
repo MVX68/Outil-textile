@@ -220,7 +220,15 @@ st.title("🧵 Vérificateur Textile Pro")
 
 with st.sidebar:
     st.header("Réglages")
-    tolerance = st.slider("Tolérance", 0, 50, 0, help="0 = Strict.")
+    # Retour à l'affichage détaillé du slider
+    tolerance = st.slider(
+        "Tolérance (Seuil d'erreur)", 
+        min_value=0, 
+        max_value=50, 
+        value=0,
+        help="0 = Précision stricte. Augmentez pour ignorer les artefacts de compression (JPG) ou les petits décalages de couleur."
+    )
+    st.info(f"Tolérance : {tolerance}")
     if st.button("Se déconnecter"):
         st.session_state.authenticated = False
         st.rerun()
