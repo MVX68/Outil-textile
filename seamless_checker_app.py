@@ -220,13 +220,13 @@ st.title("🧵 Vérificateur Textile Pro")
 
 with st.sidebar:
     st.header("Réglages")
-    # Retour à l'affichage détaillé du slider
+    # Modification de la plage de tolérance comme demandé (55-65)
     tolerance = st.slider(
         "Tolérance (Seuil d'erreur)", 
-        min_value=0, 
-        max_value=50, 
-        value=0,
-        help="0 = Précision stricte. Augmentez pour ignorer les artefacts de compression (JPG) ou les petits décalages de couleur."
+        min_value=55, 
+        max_value=65, 
+        value=60,
+        help="Plage restreinte entre 55 et 65 pour filtrer les erreurs mineures et artefacts."
     )
     st.info(f"Tolérance : {tolerance}")
     if st.button("Se déconnecter"):
