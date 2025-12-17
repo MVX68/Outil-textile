@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Application Web Streamlit pour la Vérification de Raccord de Motif Textile.
-Version Sécurisée avec Mot de Passe et Moteur FFT.
+Version Sécurisée + Optimisation Mémoire (Garbage Collection) pour éviter les crashs.
 
 Dépendances: streamlit, Pillow, numpy
 Lancement: python -m streamlit run seamless_checker_app.py
@@ -12,15 +12,13 @@ import numpy as np
 from io import BytesIO
 import pandas as pd
 import traceback
+import gc # Garbage Collector pour vider la mémoire manuellement
 
 # --- CONFIGURATION SÉCURITÉ ---
-# Modifiez ce mot de passe ici !
 MOT_DE_PASSE = "textile2025" 
 
-# --- CORRECTION DE L'ERREUR "DecompressionBombError" ---
 Image.MAX_IMAGE_PIXELS = None 
 
-# Configuration de la page Streamlit
 st.set_page_config(
     page_title="Vérificateur Textile Pro",
     layout="wide",
@@ -29,31 +27,23 @@ st.set_page_config(
 
 # --- FONCTION DE CONNEXION ---
 def check_password():
-    """Gère l'écran de connexion."""
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
 
     if not st.session_state.authenticated:
         st.title("🔒 Accès Restreint")
-        st.write("Veuillez entrer le code d'accès pour utiliser l'outil.")
-        
         pwd = st.text_input("Mot de passe :", type="password")
-        
         if st.button("Se connecter"):
             if pwd == MOT_DE_PASSE:
                 st.session_state.authenticated = True
-                st.rerun() # Recharge la page pour afficher l'app
+                st.rerun()
             else:
                 st.error("Mot de passe incorrect.")
-        
-        # Arrête l'exécution du script ici tant que le mot de passe n'est pas bon
         st.stop()
 
-# 1. On lance la vérification du mot de passe AVANT tout le reste
 check_password()
 
-
-# --- MOTEUR D'ANALYSE (Code Principal) ---
+# --- MOTEUR D'ANALYSE ---
 
 def process_image_for_analysis(img):
     try:
@@ -70,9 +60,6 @@ def process_image_for_analysis(img):
         return img.convert("RGB")
 
 def get_optimal_shift_fft(static_arr, moving_arr, axis):
-    """
-    Utilise la FFT pour trouver le décalage optimal.
-    """
     s_gray = np.mean(static_arr, axis=1)
     m_gray = np.mean(moving_arr, axis=1)
     f_s = np.fft.fft(s_gray)
@@ -82,10 +69,11 @@ def get_optimal_shift_fft(static_arr, moving_arr, axis):
     return int(best_shift)
 
 def generate_simulation(img, repeat_mode):
+    # On redimensionne tout de suite pour économiser la RAM
     img_sim = process_image_for_analysis(img)
     w, h = img_sim.size
     
-    MAX_PREVIEW_SIZE = 1000 
+    MAX_PREVIEW_SIZE = 800 # Réduit légèrement pour économiser de la mémoire
     if w > MAX_PREVIEW_SIZE or h > MAX_PREVIEW_SIZE:
         img_sim.thumbnail((MAX_PREVIEW_SIZE, MAX_PREVIEW_SIZE), Image.Resampling.LANCZOS)
         w, h = img_sim.size 
@@ -112,6 +100,7 @@ def generate_simulation(img, repeat_mode):
                     x += (w // 2)
                     if c == 0: simulation.paste(img_sim, (x - w, y))
             simulation.paste(img_sim, (x, y))
+    
     return simulation
 
 def draw_error_overlay(draw, debug_w, debug_h, orig_w, orig_h, error_mask, axis, repeat_mode, img_array, shift_val=0):
@@ -204,6 +193,11 @@ def check_pattern_seam(img, repeat_mode='standard', tolerance=0, generate_debug=
             draw_error_overlay(draw, debug_img.width, debug_img.height, width, height, error_info_h['mask'], 'H', repeat_mode, img_array, error_info_h['shift'])
         if error_info_v:
             draw_error_overlay(draw, debug_img.width, debug_img.height, width, height, error_info_v['mask'], 'V', repeat_mode, img_array, error_info_v['shift'])
+    
+    # NETTOYAGE MÉMOIRE IMMÉDIAT
+    del clean_img
+    del img_array
+    
     return max_diff_horizontal, max_diff_vertical, debug_img
 
 def detect_best_mode(img, tolerance=0):
@@ -220,7 +214,6 @@ st.title("🧵 Vérificateur Textile Pro")
 
 with st.sidebar:
     st.header("Réglages")
-    # Modification de la plage de tolérance comme demandé (55-65)
     tolerance = st.slider(
         "Tolérance (Seuil d'erreur)", 
         min_value=55, 
@@ -241,37 +234,92 @@ uploaded_files = st.file_uploader("Fichiers (PNG, JPG, TIFF) :", type=['png', 'j
 
 if uploaded_files:
     if st.button(f"Analyser {len(uploaded_files)} fichier(s)", type="primary"):
-        results = []
-        with st.spinner('Analyse FFT en cours...'):
-            for uploaded_file in uploaded_files:
-                try:
-                    image_data = uploaded_file.read()
-                    image = Image.open(BytesIO(image_data))
-                    max_h, max_v, debug_img = check_pattern_seam(image, mode_choice, tolerance)
-                    sim_img = generate_simulation(image, mode_choice)
-                    is_ok = (max_h <= tolerance) and (max_v <= tolerance)
-                    suggestion = None
-                    if not is_ok:
-                        best_mode, best_err = detect_best_mode(image, tolerance)
-                        if best_mode != mode_choice and best_err <= tolerance:
-                            suggestion = best_mode
-                    results.append({"Fichier": uploaded_file.name, "Statut": "✅ OK" if is_ok else "❌ KO", "Err. Horiz.": max_h, "Err. Vert.": max_v, "Simulation": sim_img, "Original": image, "Debug_Img": debug_img, "Suggestion": suggestion})
-                except Exception as e:
-                    results.append({"Fichier": uploaded_file.name, "Statut": "⚠️ ERREUR", "Err. Horiz.": 255, "Err. Vert.": 255, "Simulation": None, "Original": None, "Debug_Img": None, "Suggestion": None})
         
-        st.subheader("Résultats")
-        for res in results:
-            container = st.expander(f"{res['Fichier']} - {res['Statut']}", expanded=(res["Statut"] != "✅ OK"))
-            with container:
-                if res.get("Suggestion"): st.warning(f"Suggestion : Essayez le mode {res['Suggestion'].upper()}")
-                if res['Original']:
-                    c1, c2 = st.columns([1, 2])
-                    with c1:
-                        st.image(res['Original'], use_container_width=True)
-                        if res['Err. Horiz.'] > tolerance: st.error(f"H: Erreur {res['Err. Horiz.']}")
-                        else: st.success(f"H: OK")
-                        if res['Err. Vert.'] > tolerance: st.error(f"V: Erreur {res['Err. Vert.']}")
-                        else: st.success(f"V: OK")
-                        if res['Debug_Img']: st.image(res['Debug_Img'], caption="Erreurs", use_container_width=True)
-                    with c2:
-                        st.image(res['Simulation'], use_container_width=True)
+        # Barre de progression
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Zone pour afficher les résultats au fur et à mesure
+        results_container = st.container()
+        
+        # Liste légère pour le résumé final (sans images)
+        summary_data = []
+        
+        for i, uploaded_file in enumerate(uploaded_files):
+            status_text.text(f"Traitement de {uploaded_file.name} ({i+1}/{len(uploaded_files)})...")
+            
+            try:
+                # 1. Chargement
+                image_data = uploaded_file.read()
+                image = Image.open(BytesIO(image_data))
+                
+                # 2. Analyse
+                max_h, max_v, debug_img = check_pattern_seam(image, mode_choice, tolerance)
+                sim_img = generate_simulation(image, mode_choice)
+                
+                is_ok = (max_h <= tolerance) and (max_v <= tolerance)
+                
+                # Suggestion (si nécessaire)
+                suggestion = None
+                if not is_ok:
+                    best_mode, best_err = detect_best_mode(image, tolerance)
+                    if best_mode != mode_choice and best_err <= tolerance:
+                        suggestion = best_mode
+                
+                statut_icon = "✅ OK" if is_ok else "❌ KO"
+                
+                # 3. Affichage IMMÉDIAT (pour libérer la variable image ensuite)
+                with results_container:
+                    container = st.expander(f"{uploaded_file.name} - {statut_icon}", expanded=(not is_ok))
+                    with container:
+                        if suggestion: 
+                            st.warning(f"Suggestion : Essayez le mode {suggestion.upper()}")
+                        
+                        c1, c2 = st.columns([1, 2])
+                        with c1:
+                            # Affichage miniature de l'original pour économiser RAM navigateur
+                            # On n'affiche plus l'original HD ici, juste le debug ou la simulation
+                            if max_h > tolerance: st.error(f"H: Erreur {max_h}")
+                            else: st.success(f"H: OK")
+                            if max_v > tolerance: st.error(f"V: Erreur {max_v}")
+                            else: st.success(f"V: OK")
+                            
+                            if debug_img: 
+                                st.image(debug_img, caption="Erreurs", use_container_width=True)
+                            else:
+                                # Si pas d'erreur, on montre une version réduite de l'original
+                                small_preview = image.copy()
+                                small_preview.thumbnail((500, 500))
+                                st.image(small_preview, caption="Aperçu", use_container_width=True)
+                                del small_preview
+
+                        with c2:
+                            st.image(sim_img, use_container_width=True)
+
+                # 4. Stockage données légères pour résumé
+                summary_data.append({
+                    "Fichier": uploaded_file.name, 
+                    "Statut": statut_icon,
+                    "Err. H": max_h, 
+                    "Err. V": max_v
+                })
+
+                # 5. NETTOYAGE VIOLENT DE LA MÉMOIRE
+                del image
+                del sim_img
+                del debug_img
+                del image_data
+                gc.collect() # Force le nettoyage de la RAM
+            
+            except Exception as e:
+                st.error(f"Erreur sur {uploaded_file.name}: {e}")
+            
+            # Mise à jour barre
+            progress_bar.progress((i + 1) / len(uploaded_files))
+        
+        status_text.text("Terminé !")
+        
+        # Affichage du tableau récapitulatif à la fin (léger)
+        st.divider()
+        st.subheader("Résumé Global")
+        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
