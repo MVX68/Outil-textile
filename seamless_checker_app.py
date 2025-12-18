@@ -110,9 +110,9 @@ def analyze_seam(static_edge, moving_edge, repeat_mode, axis_len, tolerance):
     Compare deux bords avec logique FFT et tolérance.
     Retourne: max_error, error_mask, shift_utilisé
     """
-    # Recherche du shift optimal si nécessaire
+    # Recherche du shift optimal si nécessaire (uniquement pour half_drop sur l'axe H)
     shift = 0
-    if repeat_mode in ['half_drop', 'brick']: 
+    if repeat_mode == 'half_drop': 
         shift = get_optimal_shift_fft(static_edge, moving_edge)
     
     # Application du shift (rotation du tableau)
@@ -150,9 +150,6 @@ def create_debug_thumbnail(img, error_mask_h, shift_h, error_mask_v, shift_v, re
     THICKNESS = 4
     WHITE_THRESHOLD = 250
     
-    # Pour vérifier la blancheur, on a besoin de l'image originale redimensionnée pareil mais pas assombrie
-    # (Approximation pour performance : on ne vérifie pas la blancheur pixel perfect ici pour économiser RAM)
-    
     # Dessin H (Lignes verticales d'erreur)
     if error_mask_h is not None:
         indices = np.where(error_mask_h)[0]
@@ -177,13 +174,8 @@ def create_debug_thumbnail(img, error_mask_h, shift_h, error_mask_v, shift_v, re
             # Bord Bas (Rouge)
             draw.rectangle([x, thumb.height - THICKNESS, x+2, thumb.height], fill="#FF0000")
             
-            # Bord Haut (Bleu)
-            if repeat_mode == 'brick':
-                idx_shifted = (idx - shift_v) % w
-                x_s = int(idx_shifted * scale_x)
-                draw.rectangle([x_s, 0, x_s+2, THICKNESS], fill="#0088FF")
-            else:
-                draw.rectangle([x, 0, x+2, THICKNESS], fill="#FF0000")
+            # Bord Haut (Bleu) - En mode standard ou half-drop (pas de décalage V)
+            draw.rectangle([x, 0, x+2, THICKNESS], fill="#FF0000")
                 
     return thumb
 
@@ -201,7 +193,6 @@ def generate_simulation_light(img, repeat_mode):
     
     cols, rows = 3, 3
     if repeat_mode == 'half_drop': canvas_w, canvas_h = target_w * cols, target_h * rows
-    elif repeat_mode == 'brick': canvas_w, canvas_h = target_w * cols + (target_w // 2), target_h * rows
     else: canvas_w, canvas_h = target_w * cols, target_h * rows
     
     sim = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))
@@ -213,10 +204,6 @@ def generate_simulation_light(img, repeat_mode):
                 if c % 2 != 0: 
                     y += (target_h // 2)
                     if r == 0: sim.paste(img_small, (x, y - target_h))
-            elif repeat_mode == 'brick':
-                if r % 2 != 0: 
-                    x += (target_w // 2)
-                    if c == 0: sim.paste(img_small, (x - target_w, y))
             sim.paste(img_small, (x, y))
             
     return sim
@@ -226,9 +213,13 @@ def detect_best_mode(img, tolerance):
     Fonction simplifiée pour suggérer le bon mode sans faire exploser la RAM.
     On teste rapidement les shifts FFT sur une version réduite.
     """
-    # Pour la détection, on ne fait pas l'analyse complète pixel-perfect, trop lourd.
-    # On se base sur le mode sélectionné par l'utilisateur s'il échoue.
-    return None, 255
+    # Liste réduite sans brick
+    modes = ['standard', 'half_drop']
+    results = {}
+    for m in modes:
+        h, v, _ = check_pattern_seam(img, m, tolerance, generate_debug=False)
+        results[m] = h + v 
+    return min(results, key=results.get), results[min(results, key=results.get)]
 
 # --- LOGIQUE PRINCIPALE ---
 
@@ -246,7 +237,7 @@ with st.sidebar:
         st.session_state.authenticated = False
         st.rerun()
 
-mode_choice = st.radio("Type de Raccord :", ('standard', 'half_drop', 'brick'), format_func=lambda x: {'standard': "Standard (Droit)", 'half_drop': "Sauté (Half-Drop)", 'brick': "Quinconce"}[x], horizontal=True)
+mode_choice = st.radio("Type de Raccord :", ('standard', 'half_drop'), format_func=lambda x: {'standard': "Standard (Droit)", 'half_drop': "Sauté (Half-Drop)"}[x], horizontal=True)
 
 st.info("💡 Les fichiers sont traités en flux tendu pour une performance maximale.")
 
@@ -272,9 +263,10 @@ if uploaded_files:
                 max_h, mask_h, shift_h = analyze_seam(right, left, mode_h, h, tolerance)
                 
                 # 3. Analyse V (Bords Haut/Bas uniquement)
+                # En mode standard ou half-drop, l'axe vertical est toujours standard (pas de décalage)
                 top = extract_edge(img, 'top')
                 bottom = extract_edge(img, 'bottom')
-                mode_v = 'brick' if mode_choice == 'brick' else 'standard'
+                mode_v = 'standard'
                 max_v, mask_v, shift_v = analyze_seam(bottom, top, mode_v, w, tolerance)
                 
                 # 4. Statut
