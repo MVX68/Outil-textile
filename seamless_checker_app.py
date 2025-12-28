@@ -1,329 +1,307 @@
-# -*- coding: utf-8 -*-
-"""
-Application Web Streamlit pour la Vérification de Raccord de Motif Textile.
-Version "Ultimate" : Optimisation RAM extrême (Crop) + Analyse robuste (FFT).
-
-Dépendances: streamlit, Pillow, numpy, psutil
-Lancement: python -m streamlit run seamless_checker_app.py
-"""
 import streamlit as st
-from PIL import Image, ImageOps, ImageDraw, ImageEnhance
+from PIL import Image, ImageOps, ImageDraw
 import numpy as np
-from io import BytesIO
-import pandas as pd
-import traceback
-import gc
-import os
 import psutil
+import os
+import gc
+import math
 
-# --- CONFIGURATION SÉCURITÉ ---
-MOT_DE_PASSE = "textile2025" 
-Image.MAX_IMAGE_PIXELS = None # Désactivation limite pixels pour les gros fichiers
-
+# --- CONFIGURATION INITIALE & SÉCURITÉ ---
 st.set_page_config(
-    page_title="Vérificateur Textile Pro",
+    page_title="Mitwill Seamless Checker Pro",
+    page_icon="🧵",
     layout="wide",
-    initial_sidebar_state="auto"
+    initial_sidebar_state="expanded"
 )
 
-# --- UTILITAIRES SYSTÈME ---
-def check_memory():
-    """Affiche l'état de la mémoire pour prévenir les crashs."""
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / 1024 / 1024 # En Mo
-    if mem > 800:
-        st.sidebar.warning(f"⚠️ Mémoire élevée: {int(mem)} Mo. Le serveur va nettoyer automatiquement.")
-    return mem
+Image.MAX_IMAGE_PIXELS = None
+
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
 
 def check_password():
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
+    def password_entered():
+        if st.session_state["password"] == "textile2025":
+            st.session_state.authenticated = True
+            del st.session_state["password"]
+        else:
+            st.session_state.authenticated = False
+            st.error("Mot de passe incorrect")
+
     if not st.session_state.authenticated:
-        st.title("🔒 Accès Restreint")
-        pwd = st.text_input("Mot de passe :", type="password")
-        if st.button("Se connecter"):
-            if pwd == MOT_DE_PASSE:
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Mot de passe incorrect.")
-        st.stop()
+        st.text_input("Mot de passe Technicien", type="password", on_change=password_entered, key="password")
+        return False
+    return True
 
-check_password()
+if not check_password():
+    st.stop()
 
-# --- MOTEUR D'ANALYSE (OPTIMISÉ) ---
+# --- FONCTIONS UTILITAIRES ---
 
-def prepare_image(img):
-    """Gère l'orientation et convertit en RGB proprement."""
-    try: img = ImageOps.exif_transpose(img)
-    except: pass
-    
-    if img.mode != 'RGB':
-        # Gestion transparence optimisée
-        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-            bg = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode != 'RGBA': img = img.convert('RGBA')
-            bg.paste(img, mask=img.split()[3])
-            return bg
-        return img.convert('RGB')
+def get_ram_usage():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
+
+def load_image_optimized(uploaded_file):
+    img = Image.open(uploaded_file)
+    img.load() 
     return img
 
-def extract_edge(img, edge_type):
+def safe_crop_to_array(img, box):
+    crop = img.crop(box)
+    # Conversion 'L' (Luminance) suffisante pour détecter les structures
+    arr = np.array(crop.convert('L'), dtype=np.int16) 
+    del crop
+    return arr
+
+# --- CŒUR MATHÉMATIQUE AVANCÉ (V2) ---
+
+def smooth_signal(signal, window_size=3):
+    """Lisse le signal pour ignorer le bruit JPG/Grain (Moyenne glissante)."""
+    kernel = np.ones(window_size) / window_size
+    # Mode 'same' garde la même taille de tableau
+    return np.convolve(signal, kernel, mode='same')
+
+def analyze_seam_fft(signal1, signal2):
     """
-    Extrait UNIQUEMENT la ligne de pixels nécessaire pour économiser la RAM.
-    edge_type: 'left', 'right', 'top', 'bottom'
+    Analyse robuste V2 :
+    1. Guard: Check si zone unie (évite faux positifs sur fond blanc).
+    2. Smooth: Lissage pour éviter le bruit.
+    3. FFT: Corrélation de phase.
     """
+    # 1. SOLID COLOR GUARD (Protection Fond Uni)
+    # Si l'écart-type est très faible (< 5 sur 255), c'est du blanc/noir/uni.
+    std1 = np.std(signal1)
+    std2 = np.std(signal2)
+    
+    if std1 < 5 and std2 < 5:
+        # C'est un fond uni, donc c'est "raccord" par définition.
+        return 100.0, 0
+
+    # 2. SIGNAL SMOOTHING (Réduction Bruit JPG)
+    s1 = smooth_signal(signal1)
+    s2 = smooth_signal(signal2)
+
+    # Normalisation (Centrer sur 0)
+    s1 = s1 - np.mean(s1)
+    s2 = s2 - np.mean(s2)
+    
+    # 3. FFT CORRELATION
+    f1 = np.fft.fft(s1)
+    f2 = np.fft.fft(s2)
+    correlation = np.fft.ifft(f1 * np.conj(f2))
+    
+    shift = np.argmax(np.abs(correlation))
+    
+    # Calcul du score visuel basé sur la différence moyenne des signaux lissés
+    # On aligne mathématiquement les signaux selon le shift trouvé pour voir si ça matche
+    # (Note: Pour l'UI simple, on compare sans shift pour pénaliser le décalage actuel)
+    diff = np.mean(np.abs(s1 - s2))
+    
+    # Score 0-100. Une différence moyenne de 0 = 100. Diff de 20 = 80.
+    # On est un peu plus tolérant grâce au lissage.
+    score_visual = max(0, 100 - diff)
+    
+    return score_visual, shift
+
+def get_shift_message(shift, axis, img_dim):
+    if shift == 0:
+        return None
+    msg = ""
+    abs_shift = abs(int(shift))
+    
+    # Seuil minimal pour suggérer une correction (éviter de dire "bouger de 1px" pour rien)
+    if abs_shift < 2: 
+        return "Décalage infime (<2px), vérifier visuellement."
+
+    if axis == "V": 
+        direction = "VERS LE HAUT" if shift > 0 else "VERS LE BAS"
+        msg = f"Décaler le bord Droit de {abs_shift}px {direction}"
+    else: 
+        direction = "VERS LA GAUCHE" if shift > 0 else "VERS LA DROITE"
+        msg = f"Décaler le Bas de {abs_shift}px {direction}"
+    return msg
+
+def check_seamlessness(img, mode="Standard", tolerance=60):
     w, h = img.size
-    if edge_type == 'left':
-        # Crop retourne une image, on convertit en array (h, 1, 3)
-        return np.array(img.crop((0, 0, 1, h)).convert('RGB')) 
-    elif edge_type == 'right':
-        return np.array(img.crop((w-1, 0, w, h)).convert('RGB'))
-    elif edge_type == 'top':
-        # Crop (1, w, 3). On transpose pour avoir une structure uniforme (N, 1, 3) pour l'analyse FFT
-        arr = np.array(img.crop((0, 0, w, 1)).convert('RGB')) 
-        return np.transpose(arr, (1, 0, 2)) 
-    elif edge_type == 'bottom':
-        arr = np.array(img.crop((0, h-1, w, h)).convert('RGB'))
-        return np.transpose(arr, (1, 0, 2))
+    
+    # V2: Augmentation de la bande d'analyse à 5px pour plus de robustesse
+    strip_size = 5 
+    
+    # --- 1. Raccord Vertical (Bord Gauche vs Bord Droit) ---
+    # Crop Gauche (Hauteur h, Largeur 5)
+    left_arr = safe_crop_to_array(img, (0, 0, strip_size, h))
+    # Crop Droit
+    right_arr = safe_crop_to_array(img, (w - strip_size, 0, w, h))
+    
+    # Important : On fait la moyenne sur la LARGEUR de la bandelette (axis=1)
+    # pour obtenir un profil 1D de longueur H (le motif qui descend).
+    left_profile = np.mean(left_arr, axis=1)
+    right_profile = np.mean(right_arr, axis=1)
+    
+    score_v, shift_v = analyze_seam_fft(left_profile, right_profile)
+    
+    del left_arr, right_arr, left_profile, right_profile
+    gc.collect()
 
-def get_optimal_shift_fft(static_arr, moving_arr):
-    """FFT optimisée sur les vecteurs 1D."""
-    # static_arr et moving_arr sont de forme (N, 1, 3) -> On aplatit à (N, 3) puis moyenne -> (N,)
-    # On compare les profils de luminosité moyenne
-    s_gray = np.mean(static_arr[:, 0, :], axis=1)
-    m_gray = np.mean(moving_arr[:, 0, :], axis=1)
+    # --- 2. Raccord Horizontal (Haut vs Bas) ---
+    top_arr = safe_crop_to_array(img, (0, 0, w, strip_size))
+    bottom_arr = safe_crop_to_array(img, (0, h - strip_size, w, h))
     
-    # FFT (Fast Fourier Transform)
-    f_s = np.fft.fft(s_gray)
-    f_m = np.fft.fft(m_gray)
-    
-    # Corrélation croisée
-    corr = np.fft.ifft(f_s * np.conj(f_m))
-    
-    # Le pic indique le meilleur alignement
-    best_shift = np.argmax(np.abs(corr))
-    return int(best_shift)
+    if mode == "Half-Drop (Sauté)":
+        shift_amount = w // 2
+        bottom_arr = np.roll(bottom_arr, shift_amount, axis=1)
 
-def analyze_seam(static_edge, moving_edge, repeat_mode, axis_len, tolerance):
-    """
-    Compare deux bords avec logique FFT et tolérance.
-    Retourne: max_error, error_mask, shift_utilisé
-    """
-    # Recherche du shift optimal si nécessaire (uniquement pour half_drop sur l'axe H)
-    shift = 0
-    if repeat_mode == 'half_drop': 
-        shift = get_optimal_shift_fft(static_edge, moving_edge)
-    
-    # Application du shift (rotation du tableau)
-    if shift != 0:
-        shifted_moving = np.roll(moving_edge, shift, axis=0)
-    else:
-        shifted_moving = moving_edge
+    # Important : On fait la moyenne sur la HAUTEUR de la bandelette (axis=0)
+    # pour obtenir un profil 1D de longueur W (le motif qui traverse).
+    top_profile = np.mean(top_arr, axis=0)
+    bottom_profile = np.mean(bottom_arr, axis=0)
 
-    # Calcul de la différence absolue
-    diff = np.abs(static_edge.astype(np.int16) - shifted_moving.astype(np.int16))
-    max_diff = np.max(diff)
+    score_h, shift_h = analyze_seam_fft(top_profile, bottom_profile)
     
-    # Création du masque d'erreur
-    # On considère une erreur si la différence moyenne RGB du pixel dépasse la tolérance
-    pixel_diffs = np.mean(diff, axis=2) # (N, 1)
-    error_mask = (pixel_diffs > tolerance).flatten() # (N,)
+    del top_arr, bottom_arr, top_profile, bottom_profile
+    gc.collect()
     
-    return max_diff, error_mask, shift
+    # --- Interprétation ---
+    is_seamless_v = score_v >= tolerance
+    is_seamless_h = score_h >= tolerance
+    
+    return {
+        "score_v": score_v,
+        "score_h": score_h,
+        "shift_v_detected": shift_v if shift_v < h/2 else shift_v - h,
+        "shift_h_detected": shift_h if shift_h < w/2 else shift_h - w,
+        "is_seamless": is_seamless_v and is_seamless_h
+    }
 
-def create_debug_thumbnail(img, error_mask_h, shift_h, error_mask_v, shift_v, repeat_mode):
-    """Crée une miniature légère avec les erreurs dessinées."""
+# --- VISUALISATION ---
+
+def generate_seam_zoom(img, mode, axis="H"):
     w, h = img.size
+    zoom_size = 150
     
-    # Création miniature (on travaille sur une petite image pour la vitesse)
+    if axis == "H":
+        top_sample = img.crop((w//2 - zoom_size//2, 0, w//2 + zoom_size//2, zoom_size))
+        if mode == "Half-Drop (Sauté)":
+            start_x = (w//2 + w//2) % w
+            bottom_sample = img.crop((start_x - zoom_size//2, h - zoom_size, start_x + zoom_size//2, h))
+        else:
+            bottom_sample = img.crop((w//2 - zoom_size//2, h - zoom_size, w//2 + zoom_size//2, h))
+
+        proof = Image.new('RGB', (zoom_size, zoom_size*2))
+        proof.paste(bottom_sample, (0, 0)) 
+        proof.paste(top_sample, (0, zoom_size))
+        draw = ImageDraw.Draw(proof)
+        draw.line([(0, zoom_size), (zoom_size, zoom_size)], fill="red", width=1)
+        
+    else: # axis == "V"
+        right_sample = img.crop((w - zoom_size, h//2 - zoom_size//2, w, h//2 + zoom_size//2))
+        left_sample = img.crop((0, h//2 - zoom_size//2, zoom_size, h//2 + zoom_size//2))
+        
+        proof = Image.new('RGB', (zoom_size*2, zoom_size))
+        proof.paste(right_sample, (0, 0))
+        proof.paste(left_sample, (zoom_size, 0))
+        draw = ImageDraw.Draw(proof)
+        draw.line([(zoom_size, 0), (zoom_size, zoom_size)], fill="red", width=1)
+    
+    return proof
+
+def generate_3x3_preview(img, mode):
     thumb = img.copy()
-    thumb.thumbnail((800, 800)) 
+    thumb.thumbnail((300, 300))
+    tw, th = thumb.size
+    sim_w, sim_h = tw * 3, th * 3
+    sim_img = Image.new('RGB', (sim_w, sim_h))
     
-    # Assombrir pour faire ressortir les traits
-    enhancer = ImageEnhance.Brightness(thumb)
-    thumb = enhancer.enhance(0.4)
-    draw = ImageDraw.Draw(thumb)
-    
-    scale_x = thumb.width / w
-    scale_y = thumb.height / h
-    THICKNESS = 4
-    WHITE_THRESHOLD = 250
-    
-    # Dessin H (Lignes verticales d'erreur)
-    if error_mask_h is not None:
-        indices = np.where(error_mask_h)[0]
-        for idx in indices:
-            y = int(idx * scale_y)
-            # Bord Droit (Rouge)
-            draw.rectangle([thumb.width - THICKNESS, y, thumb.width, y+2], fill="#FF0000")
-            
-            # Bord Gauche (Bleu) - Position décalée
-            if repeat_mode == 'half_drop':
-                idx_shifted = (idx - shift_h) % h
-                y_s = int(idx_shifted * scale_y)
-                draw.rectangle([0, y_s, THICKNESS, y_s+2], fill="#0088FF")
-            else:
-                draw.rectangle([0, y, THICKNESS, y+2], fill="#FF0000")
+    for r in range(3):
+        for c in range(3):
+            x = c * tw
+            y = r * th
+            if mode == "Half-Drop (Sauté)" and c % 2 != 0:
+                y += th // 2
+                if y > sim_h: y -= sim_h
+            sim_img.paste(thumb, (x, y))
+    return sim_img
 
-    # Dessin V (Lignes horizontales d'erreur)
-    if error_mask_v is not None:
-        indices = np.where(error_mask_v)[0]
-        for idx in indices:
-            x = int(idx * scale_x)
-            # Bord Bas (Rouge)
-            draw.rectangle([x, thumb.height - THICKNESS, x+2, thumb.height], fill="#FF0000")
-            
-            # Bord Haut (Bleu) - En mode standard ou half-drop (pas de décalage V)
-            draw.rectangle([x, 0, x+2, THICKNESS], fill="#FF0000")
+# --- UI PRINCIPALE ---
+
+st.sidebar.title("🏭 Mitwill Microfactory")
+st.sidebar.markdown("---")
+
+mode = st.sidebar.radio("Mode de Raccord", ["Standard (Droit)", "Half-Drop (Sauté)"])
+tolerance = st.sidebar.slider("Tolérance (Anti-Bruit)", 55, 75, 60, help="Augmentez si vos fichiers sont très bruités (JPG)")
+
+st.sidebar.markdown("### 📊 État Système")
+ram_placeholder = st.sidebar.empty()
+
+st.title("🧵 Smart Seamless Checker V2")
+st.markdown("*Analyse mathématique robuste (Anti-bruit & détection zones unies)*")
+
+uploaded_file = st.file_uploader("Glisser le motif ici (Max 500Mo)", type=['png', 'jpg', 'jpeg', 'tiff', 'tif'])
+
+if uploaded_file:
+    try:
+        img = load_image_optimized(uploaded_file)
+        w, h = img.size
+        st.success(f"Image chargée : {w}x{h} px | Mode : {img.mode}")
+        ram_placeholder.metric("RAM Utilisée", f"{get_ram_usage():.1f} Mo")
+
+        if st.button("Lancer l'Analyse (FFT V2)", type="primary"):
+            with st.spinner("Extraction, Lissage & Calcul FFT..."):
+                results = check_seamlessness(img, mode, tolerance)
                 
-    return thumb
+                col1, col2, col3 = st.columns(3)
+                
+                col1.metric("Score Vertical (G/D)", f"{results['score_v']:.1f}/100", 
+                           delta="OK" if results['score_v'] >= tolerance else "CASSURE",
+                           delta_color="normal" if results['score_v'] >= tolerance else "inverse")
+                
+                col2.metric("Score Horizontal (H/B)", f"{results['score_h']:.1f}/100",
+                           delta="OK" if results['score_h'] >= tolerance else "CASSURE",
+                           delta_color="normal" if results['score_h'] >= tolerance else "inverse")
+                
+                status_color = "green" if results['is_seamless'] else "red"
+                status_text = "RACCORD VALIDE" if results['is_seamless'] else "CORRECTION REQUISE"
+                col3.markdown(f"<h3 style='color:{status_color}; text-align:center;'>{status_text}</h3>", unsafe_allow_html=True)
 
-def generate_simulation_light(img, repeat_mode):
-    """Génère la simulation 3x3 de manière très optimisée (redimensionnement préalable)."""
-    w, h = img.size
-    
-    # On redimensionne drastiquement AVANT de tiler
-    # Une tuile de 400px est suffisante pour juger le raccord visuel global
-    target_w = 400
-    ratio = target_w / w
-    target_h = int(h * ratio)
-    
-    img_small = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    
-    cols, rows = 3, 3
-    if repeat_mode == 'half_drop': canvas_w, canvas_h = target_w * cols, target_h * rows
-    else: canvas_w, canvas_h = target_w * cols, target_h * rows
-    
-    sim = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))
-    
-    for c in range(cols):
-        for r in range(rows):
-            x, y = c * target_w, r * target_h
-            if repeat_mode == 'half_drop':
-                if c % 2 != 0: 
-                    y += (target_h // 2)
-                    if r == 0: sim.paste(img_small, (x, y - target_h))
-            sim.paste(img_small, (x, y))
-            
-    return sim
+                if not results['is_seamless']:
+                    with st.expander("🛠️ Diagnostic & Correction", expanded=True):
+                        st.warning("Le motif présente des discontinuités.")
+                        
+                        if results['score_v'] < tolerance:
+                            shift_v = results['shift_v_detected']
+                            msg_v = get_shift_message(shift_v, "V", h)
+                            st.info(f"**Problème Vertical** : {msg_v}")
 
-def detect_best_mode(img, tolerance):
-    """
-    Fonction simplifiée pour suggérer le bon mode sans faire exploser la RAM.
-    On teste rapidement les shifts FFT sur une version réduite.
-    """
-    # Liste réduite sans brick
-    modes = ['standard', 'half_drop']
-    results = {}
-    for m in modes:
-        h, v, _ = check_pattern_seam(img, m, tolerance, generate_debug=False)
-        results[m] = h + v 
-    return min(results, key=results.get), results[min(results, key=results.get)]
+                        if results['score_h'] < tolerance:
+                            shift_h = results['shift_h_detected']
+                            msg_h = get_shift_message(shift_h, "H", w)
+                            st.info(f"**Problème Horizontal** : {msg_h}")
 
-# --- LOGIQUE PRINCIPALE ---
+                st.markdown("---")
+                st.subheader("🔍 Preuve Visuelle")
+                c_vis1, c_vis2, c_vis3 = st.columns([1, 1, 2])
+                
+                with c_vis1:
+                    st.caption("Zoom Vertical (G/D)")
+                    proof_v = generate_seam_zoom(img, mode, axis="V")
+                    st.image(proof_v, use_container_width=True)
 
-st.title("🧵 Vérificateur Textile Pro")
+                with c_vis2:
+                    st.caption("Zoom Horizontal (H/B)")
+                    proof_h = generate_seam_zoom(img, mode, axis="H")
+                    st.image(proof_h, use_container_width=True)
+                
+                with c_vis3:
+                    st.caption("Simulation Tissu")
+                    sim = generate_3x3_preview(img, mode)
+                    st.image(sim, use_container_width=True)
 
-with st.sidebar:
-    st.header("Paramètres")
-    # Blocage de la tolérance entre 55 et 65 comme demandé
-    tolerance = st.slider("Tolérance (Seuil d'erreur)", 55, 65, 60, help="55 = Strict, 65 = Souple")
-    
-    check_memory()
-    
-    st.markdown("---")
-    if st.button("Se déconnecter"):
-        st.session_state.authenticated = False
-        st.rerun()
+        gc.collect()
+        ram_placeholder.metric("RAM (Post-Clean)", f"{get_ram_usage():.1f} Mo")
 
-mode_choice = st.radio("Type de Raccord :", ('standard', 'half_drop'), format_func=lambda x: {'standard': "Standard (Droit)", 'half_drop': "Sauté (Half-Drop)"}[x], horizontal=True)
-
-st.info("💡 Les fichiers sont traités en flux tendu pour une performance maximale.")
-
-uploaded_files = st.file_uploader("Déposez vos fichiers ici (TIFF, JPG, PNG)", type=['png', 'jpg', 'jpeg', 'tiff', 'tif'], accept_multiple_files=True)
-
-if uploaded_files:
-    if st.button(f"Lancer l'analyse de {len(uploaded_files)} fichier(s)", type="primary"):
+    except Exception as e:
+        st.error(f"Erreur technique : {e}")
         
-        progress = st.progress(0)
-        results_area = st.container()
-        
-        for i, up_file in enumerate(uploaded_files):
-            try:
-                # 1. Chargement Image (Lazy)
-                img_orig = Image.open(BytesIO(up_file.read()))
-                img = prepare_image(img_orig)
-                w, h = img.size
-                
-                # 2. Analyse H (Bords Gauche/Droite uniquement - Très léger en RAM)
-                left = extract_edge(img, 'left')
-                right = extract_edge(img, 'right')
-                mode_h = 'half_drop' if mode_choice == 'half_drop' else 'standard'
-                max_h, mask_h, shift_h = analyze_seam(right, left, mode_h, h, tolerance)
-                
-                # 3. Analyse V (Bords Haut/Bas uniquement)
-                # En mode standard ou half-drop, l'axe vertical est toujours standard (pas de décalage)
-                top = extract_edge(img, 'top')
-                bottom = extract_edge(img, 'bottom')
-                mode_v = 'standard'
-                max_v, mask_v, shift_v = analyze_seam(bottom, top, mode_v, w, tolerance)
-                
-                # 4. Statut
-                is_ok_h = max_h <= tolerance
-                is_ok_v = max_v <= tolerance
-                is_global_ok = is_ok_h and is_ok_v
-                
-                icon = "✅" if is_global_ok else "❌"
-                
-                # 5. Génération Visuels (Uniquement pour l'affichage, puis poubelle)
-                sim_img = generate_simulation_light(img, mode_choice)
-                
-                debug_img = None
-                if not is_global_ok:
-                    debug_img = create_debug_thumbnail(
-                        img, 
-                        mask_h if not is_ok_h else None, shift_h,
-                        mask_v if not is_ok_v else None, shift_v,
-                        mode_choice
-                    )
-
-                # 6. Affichage
-                with results_area:
-                    with st.expander(f"{icon} {up_file.name}", expanded=not is_global_ok):
-                        c1, c2 = st.columns([1, 2])
-                        with c1:
-                            st.markdown(f"**Dimensions:** {w}x{h} px")
-                            
-                            # H Status
-                            if is_ok_h: st.success(f"Horizontal : OK (Diff: {max_h})")
-                            else: st.error(f"Horizontal : Erreur (Diff: {max_h})")
-                            
-                            # V Status
-                            if is_ok_v: st.success(f"Vertical : OK (Diff: {max_v})")
-                            else: st.error(f"Vertical : Erreur (Diff: {max_v})")
-                            
-                            if debug_img:
-                                st.image(debug_img, caption="Localisation des erreurs", use_container_width=True)
-                            else:
-                                # Aperçu miniature simple si tout est OK
-                                thumb_ok = img.copy()
-                                thumb_ok.thumbnail((400, 400))
-                                st.image(thumb_ok, caption="Aperçu", use_container_width=True)
-                                
-                        with c2:
-                            st.image(sim_img, caption="Simulation 3x3", use_container_width=True)
-
-                # 7. NETTOYAGE MÉMOIRE AGRESSIF
-                # On supprime toutes les références aux images lourdes
-                del img_orig, img, left, right, top, bottom, sim_img, debug_img
-                # On force le Garbage Collector de Python
-                gc.collect()
-                
-            except Exception as e:
-                st.error(f"Erreur sur {up_file.name}: {str(e)}")
-                # traceback.print_exc() # Pour debug seulement
-            
-            progress.progress((i + 1) / len(uploaded_files))
-            
-        st.success("Analyse terminée !")
+else:
+    st.info("Le système V2 est prêt (Noyau de lissage actif).")
