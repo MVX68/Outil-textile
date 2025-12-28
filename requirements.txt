@@ -1,6 +1,5 @@
 streamlit
 Pillow
 numpy
-pandas
-requests
 psutil
+watchdog
